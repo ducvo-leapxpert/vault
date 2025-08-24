@@ -286,6 +286,10 @@ func (m *PostgreSQLBackend) Put(ctx context.Context, entry *physical.Entry) erro
 
 	_, err := m.client.ExecContext(ctx, m.put_query, parentPath, path, key, entry.Value)
 	if err != nil {
+		// Check if this is a connection-related error and log it
+		if isConnectionError(err) {
+			m.logger.Warn("PostgreSQL connection error during Put operation", "error", err)
+		}
 		return err
 	}
 	return nil
@@ -308,6 +312,10 @@ func (m *PostgreSQLBackend) Get(ctx context.Context, fullPath string) (*physical
 		return nil, nil
 	}
 	if err != nil {
+		// Check if this is a connection-related error and log it
+		if isConnectionError(err) {
+			m.logger.Warn("PostgreSQL connection error during Get operation", "error", err)
+		}
 		return nil, err
 	}
 
@@ -522,4 +530,35 @@ func (l *PostgreSQLLock) writeItem() (bool, error) {
 		return false, err
 	}
 	return ar == 1, nil
+}
+
+// isConnectionError checks if the error is related to connection issues
+func isConnectionError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	errStr := err.Error()
+	// Common PostgreSQL connection error patterns
+	connectionErrors := []string{
+		"connection refused",
+		"connection reset",
+		"connection closed",
+		"connection lost",
+		"broken pipe",
+		"no connection to the server",
+		"server closed the connection",
+		"connection timed out",
+		"connection aborted",
+		"bad connection",
+		"connection does not exist",
+	}
+
+	for _, connErr := range connectionErrors {
+		if strings.Contains(strings.ToLower(errStr), connErr) {
+			return true
+		}
+	}
+
+	return false
 }
