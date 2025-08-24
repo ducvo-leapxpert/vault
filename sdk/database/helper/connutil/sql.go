@@ -259,24 +259,58 @@ func (c *SQLConnectionProducer) Connection(ctx context.Context) (interface{}, er
 		return nil, ErrNotInitialized
 	}
 
-	// If we already have a DB, test it and return
-	if c.db != nil {
-		if err := c.db.PingContext(ctx); err == nil {
-			return c.db, nil
-		}
-		// If the ping was unsuccessful, close it and ignore errors as we'll be
-		// reestablishing anyways
-		c.db.Close()
+	// Retry connection establishment with exponential backoff
+	const maxRetries = 3
+	const baseDelay = 50 * time.Millisecond
 
-		// if IAM authentication is enabled
-		// ensure open dialer is also closed
-		if c.AuthType == AuthTypeGCPIAM {
-			if c.cloudDialerCleanup != nil {
-				c.cloudDialerCleanup()
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		// If we already have a DB, test it and return
+		if c.db != nil {
+			if err := c.db.PingContext(ctx); err == nil {
+				return c.db, nil
+			}
+			// If the ping was unsuccessful, close it and ignore errors as we'll be
+			// reestablishing anyways
+			c.db.Close()
+
+			// if IAM authentication is enabled
+			// ensure open dialer is also closed
+			if c.AuthType == AuthTypeGCPIAM {
+				if c.cloudDialerCleanup != nil {
+					c.cloudDialerCleanup()
+				}
 			}
 		}
+
+		// Try to establish a new connection
+		db, err := c.createConnection(ctx)
+		if err != nil {
+			// If this is the last attempt, return the error
+			if attempt == maxRetries {
+				return nil, err
+			}
+
+			// Wait with exponential backoff before retrying
+			delay := baseDelay * time.Duration(1<<uint(attempt))
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(delay):
+				continue
+			}
+		}
+
+		// Connection established successfully, store it and return
+		c.db = db
+		return c.db, nil
 	}
 
+	// This should never be reached, but just in case
+	return nil, fmt.Errorf("failed to establish database connection after %d attempts", maxRetries+1)
+}
+
+// createConnection creates a new database connection without storing it
+func (c *SQLConnectionProducer) createConnection(ctx context.Context) (*sql.DB, error) {
 	// default non-IAM behavior
 	driverName := c.Type
 
@@ -290,6 +324,9 @@ func (c *SQLConnectionProducer) Connection(ctx context.Context) (interface{}, er
 	// Otherwise, attempt to make connection
 	// Apply PostgreSQL specific settings if needed
 	conn := applyPostgresSettings(c.ConnectionURL)
+
+	var db *sql.DB
+	var err error
 
 	if driverName == dbTypePostgres && c.TLSConfig != nil {
 		config, err := pgx.ParseConfig(conn)
@@ -310,20 +347,15 @@ func (c *SQLConnectionProducer) Connection(ctx context.Context) (interface{}, er
 			fallback.TLSConfig = config.TLSConfig
 		}
 
-		c.db = stdlib.OpenDB(*config)
-		if err != nil {
-			return nil, fmt.Errorf("failed to open connection: %w", err)
-		}
+		db = stdlib.OpenDB(*config)
 	} else if driverName == dbTypePostgres && os.Getenv(pluginutil.PluginUsePostgresSSLInline) != "" {
-		var err error
 		// TODO: remove this deprecated function call in a future SDK version
-		c.db, err = openPostgres(driverName, conn)
+		db, err = openPostgres(driverName, conn)
 		if err != nil {
 			return nil, fmt.Errorf("failed to open connection: %w", err)
 		}
 	} else {
-		var err error
-		c.db, err = sql.Open(driverName, conn)
+		db, err = sql.Open(driverName, conn)
 		if err != nil {
 			return nil, fmt.Errorf("failed to open connection: %w", err)
 		}
@@ -331,11 +363,17 @@ func (c *SQLConnectionProducer) Connection(ctx context.Context) (interface{}, er
 
 	// Set some connection pool settings. We don't need much of this,
 	// since the request rate shouldn't be high.
-	c.db.SetMaxOpenConns(c.MaxOpenConnections)
-	c.db.SetMaxIdleConns(c.MaxIdleConnections)
-	c.db.SetConnMaxLifetime(c.maxConnectionLifetime)
+	db.SetMaxOpenConns(c.MaxOpenConnections)
+	db.SetMaxIdleConns(c.MaxIdleConnections)
+	db.SetConnMaxLifetime(c.maxConnectionLifetime)
 
-	return c.db, nil
+	// Test the connection with a ping to ensure it's working
+	if err := db.PingContext(ctx); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to ping new connection: %w", err)
+	}
+
+	return db, nil
 }
 
 func (c *SQLConnectionProducer) SecretValues() map[string]interface{} {
